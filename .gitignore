@@ -1,0 +1,35 @@
+# Virtual environments
+.venv/
+venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+
+# Environment variables
+.env
+
+# Operating system
+.DS_Store
+Thumbs.db
+
+# Processed data
+data/processed/*
+
+# Generated reports
+reports/*
+!reports/threshold_config.json
+!reports/figures/
+
+# Models
+models/*
+!models/best_sla_risk_model.pkl
