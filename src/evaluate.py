@@ -1,411 +1,83 @@
-from pathlib import Path
-import json
-import pickle
+"""Score a frozen decision policy or inspect a saved bundle's evaluation."""
 
-import matplotlib.pyplot as plt
+import argparse
+import json
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 from sklearn.metrics import (
+    accuracy_score,
+    average_precision_score,
     confusion_matrix,
     f1_score,
     fbeta_score,
     precision_recall_curve,
     precision_score,
     recall_score,
+    roc_auc_score,
 )
 
-
-TARGET_COLUMN = "sla_breached"
-PROBABILITY_COLUMN = "xgboost_classifier_probability"
-
-
-def get_project_root() -> Path:
-    """Return the project root directory."""
-    return Path(__file__).resolve().parents[1]
+if __package__:
+    from .bundle import read_manifest
+else:
+    from bundle import read_manifest
 
 
-def load_predictions() -> pd.DataFrame:
-    """Load saved test predictions."""
-    path = (
-        get_project_root()
-        / "reports"
-        / "test_predictions.csv"
+MIN_VALIDATION_PRECISION = 0.30
+THRESHOLDS = np.arange(10, 91) / 100
+
+
+def select_operating_threshold(
+    actual: pd.Series, probabilities: np.ndarray
+) -> tuple[float, bool]:
+    """Maximize validation F2, preferring thresholds that meet the precision floor."""
+    scores = np.asarray(probabilities, dtype=float)
+    precision, recall, cutoffs = precision_recall_curve(actual, scores)
+    # A grid cutoff predicts the same positives as the next distinct score.
+    positions = np.searchsorted(cutoffs, THRESHOLDS)
+    precision, recall = precision[positions], recall[positions]
+    denominator = 4 * precision + recall
+    f2 = np.divide(
+        5 * precision * recall,
+        denominator,
+        out=np.zeros_like(denominator),
+        where=denominator > 0,
     )
-
-    if not path.exists():
-        raise FileNotFoundError(
-            f"Prediction file not found at {path}. "
-            "Run src/train.py first."
-        )
-
-    return pd.read_csv(
-        path,
-        parse_dates=["created_at"],
-    )
+    eligible = (precision >= MIN_VALIDATION_PRECISION) & (THRESHOLDS <= cutoffs[-1])
+    floor_met = bool(eligible.any())
+    candidates = np.where(eligible, f2, -1) if floor_met else f2
+    return float(THRESHOLDS[candidates.argmax()]), floor_met
 
 
-def calculate_threshold_metrics(
-    actual: pd.Series,
-    probabilities: pd.Series,
-    threshold: float,
+def calculate_metrics(
+    actual: pd.Series, probabilities: np.ndarray, threshold: float
 ) -> dict[str, float | int]:
-    """Calculate classification metrics at one threshold."""
-    predicted = (
-        probabilities >= threshold
-    ).astype(int)
-
-    tn, fp, fn, tp = confusion_matrix(
-        actual,
-        predicted,
-        labels=[0, 1],
-    ).ravel()
-
+    """Report ranking metrics and operating metrics at the supplied threshold."""
+    scores = np.asarray(probabilities, dtype=float)
+    predicted = scores >= threshold
+    tn, fp, fn, tp = confusion_matrix(actual, predicted, labels=[0, 1]).ravel()
     return {
-        "threshold": round(float(threshold), 3),
-        "precision": round(
-            float(
-                precision_score(
-                    actual,
-                    predicted,
-                    zero_division=0,
-                )
-            ),
-            4,
-        ),
-        "recall": round(
-            float(
-                recall_score(
-                    actual,
-                    predicted,
-                    zero_division=0,
-                )
-            ),
-            4,
-        ),
-        "f1": round(
-            float(
-                f1_score(
-                    actual,
-                    predicted,
-                    zero_division=0,
-                )
-            ),
-            4,
-        ),
-        "f2": round(
-            float(
-                fbeta_score(
-                    actual,
-                    predicted,
-                    beta=2,
-                    zero_division=0,
-                )
-            ),
-            4,
-        ),
+        "accuracy": float(accuracy_score(actual, predicted)),
+        "average_precision": float(average_precision_score(actual, scores)),
+        "roc_auc": float(roc_auc_score(actual, scores)),
+        "precision": float(precision_score(actual, predicted, zero_division=0)),
+        "recall": float(recall_score(actual, predicted, zero_division=0)),
+        "f1": float(f1_score(actual, predicted, zero_division=0)),
+        "f2": float(fbeta_score(actual, predicted, beta=2, zero_division=0)),
         "true_negatives": int(tn),
         "false_positives": int(fp),
         "false_negatives": int(fn),
         "true_positives": int(tp),
-        "predicted_risk_tickets": int(
-            predicted.sum()
-        ),
+        "alerts": int(predicted.sum()),
     }
-
-
-def evaluate_thresholds(
-    actual: pd.Series,
-    probabilities: pd.Series,
-) -> pd.DataFrame:
-    """Evaluate thresholds from 0.10 through 0.90."""
-    thresholds = np.arange(
-        0.10,
-        0.91,
-        0.01,
-    )
-
-    rows = [
-        calculate_threshold_metrics(
-            actual,
-            probabilities,
-            threshold,
-        )
-        for threshold in thresholds
-    ]
-
-    return pd.DataFrame(rows)
-
-
-def select_operating_threshold(
-    threshold_results: pd.DataFrame,
-) -> pd.Series:
-    """
-    Select the threshold with the highest F2 score.
-
-    F2 gives recall twice as much importance as precision,
-    which is suitable when missed SLA breaches are costly.
-    """
-    eligible_results = threshold_results[
-        threshold_results["precision"] >= 0.30
-    ]
-
-    if eligible_results.empty:
-        eligible_results = threshold_results
-
-    best_index = eligible_results[
-        "f2"
-    ].idxmax()
-
-    return threshold_results.loc[best_index]
-
-
-def plot_threshold_tradeoff(
-    threshold_results: pd.DataFrame,
-    selected_threshold: float,
-    output_directory: Path,
-) -> None:
-    """Plot precision, recall, F1 and F2 by threshold."""
-    figure, axis = plt.subplots(
-        figsize=(11, 6)
-    )
-
-    for metric in [
-        "precision",
-        "recall",
-        "f1",
-        "f2",
-    ]:
-        axis.plot(
-            threshold_results["threshold"],
-            threshold_results[metric],
-            label=metric.upper(),
-        )
-
-    axis.axvline(
-        selected_threshold,
-        linestyle="--",
-        label=(
-            f"Selected threshold "
-            f"({selected_threshold:.2f})"
-        ),
-    )
-
-    axis.set_title(
-        "Classification Performance by Decision Threshold"
-    )
-    axis.set_xlabel("Decision Threshold")
-    axis.set_ylabel("Metric Score")
-    axis.set_ylim(0, 1)
-    axis.legend()
-    axis.grid(alpha=0.3)
-
-    figure.tight_layout()
-    figure.savefig(
-        output_directory
-        / "threshold_tradeoff.png",
-        dpi=150,
-        bbox_inches="tight",
-    )
-
-    plt.close(figure)
-
-
-def plot_probability_distribution(
-    predictions: pd.DataFrame,
-    selected_threshold: float,
-    output_directory: Path,
-) -> None:
-    """Plot predicted probability distributions by actual class."""
-    figure, axis = plt.subplots(
-        figsize=(11, 6)
-    )
-
-    no_breach = predictions[
-        predictions[TARGET_COLUMN] == 0
-    ][PROBABILITY_COLUMN]
-
-    breach = predictions[
-        predictions[TARGET_COLUMN] == 1
-    ][PROBABILITY_COLUMN]
-
-    axis.hist(
-        no_breach,
-        bins=30,
-        alpha=0.6,
-        label="No Breach",
-    )
-
-    axis.hist(
-        breach,
-        bins=30,
-        alpha=0.6,
-        label="SLA Breach",
-    )
-
-    axis.axvline(
-        selected_threshold,
-        linestyle="--",
-        label=(
-            f"Selected threshold "
-            f"({selected_threshold:.2f})"
-        ),
-    )
-
-    axis.set_title(
-        "Predicted SLA-Risk Probability Distribution"
-    )
-    axis.set_xlabel("Predicted Breach Probability")
-    axis.set_ylabel("Ticket Count")
-    axis.legend()
-    axis.grid(alpha=0.3)
-
-    figure.tight_layout()
-    figure.savefig(
-        output_directory
-        / "probability_distribution.png",
-        dpi=150,
-        bbox_inches="tight",
-    )
-
-    plt.close(figure)
 
 
 def main() -> None:
-    """Tune and save the SLA-risk decision threshold."""
-    predictions = load_predictions()
-
-    actual = predictions[TARGET_COLUMN]
-    probabilities = predictions[
-        PROBABILITY_COLUMN
-    ]
-
-    threshold_results = evaluate_thresholds(
-        actual,
-        probabilities,
-    )
-
-    selected = select_operating_threshold(
-        threshold_results
-    )
-
-    default_metrics = calculate_threshold_metrics(
-        actual,
-        probabilities,
-        threshold=0.50,
-    )
-
-    selected_threshold = float(
-        selected["threshold"]
-    )
-
-    selected_metrics = (
-        selected.to_dict()
-    )
-
-    print("Threshold evaluation")
-    print("--------------------")
-
-    print("\nDefault threshold: 0.50")
-    for key, value in default_metrics.items():
-        if key != "threshold":
-            print(f"{key}: {value}")
-
-    print(
-        f"\nSelected threshold: "
-        f"{selected_threshold:.2f}"
-    )
-
-    for key, value in selected_metrics.items():
-        if key != "threshold":
-            print(f"{key}: {value}")
-
-    print("\nConfusion matrix comparison")
-    print("---------------------------")
-
-    print(
-        f"Default:  TP={default_metrics['true_positives']}, "
-        f"FN={default_metrics['false_negatives']}, "
-        f"FP={default_metrics['false_positives']}, "
-        f"TN={default_metrics['true_negatives']}"
-    )
-
-    print(
-        f"Selected: TP={int(selected['true_positives'])}, "
-        f"FN={int(selected['false_negatives'])}, "
-        f"FP={int(selected['false_positives'])}, "
-        f"TN={int(selected['true_negatives'])}"
-    )
-
-    report_directory = (
-        get_project_root()
-        / "reports"
-    )
-
-    figure_directory = (
-        report_directory
-        / "figures"
-    )
-
-    figure_directory.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    threshold_results.to_csv(
-        report_directory
-        / "threshold_results.csv",
-        index=False,
-    )
-
-    threshold_config = {
-        "model": "xgboost_classifier",
-        "selection_method": (
-            "Maximum F2 with minimum precision of 0.30"
-        ),
-        "selected_threshold": selected_threshold,
-        "default_threshold_metrics": default_metrics,
-        "selected_threshold_metrics": {
-            key: (
-                int(value)
-                if key in {
-                    "true_negatives",
-                    "false_positives",
-                    "false_negatives",
-                    "true_positives",
-                    "predicted_risk_tickets",
-                }
-                else float(value)
-            )
-            for key, value in selected_metrics.items()
-        },
-    }
-
-    with (
-        report_directory
-        / "threshold_config.json"
-    ).open("w", encoding="utf-8") as file:
-        json.dump(
-            threshold_config,
-            file,
-            indent=4,
-        )
-
-    plot_threshold_tradeoff(
-        threshold_results,
-        selected_threshold,
-        figure_directory,
-    )
-
-    plot_probability_distribution(
-        predictions,
-        selected_threshold,
-        figure_directory,
-    )
-
-    print(
-        "\nSaved threshold configuration to: "
-        "reports/threshold_config.json"
-    )
+    parser = argparse.ArgumentParser(description="Show evaluation saved in a model bundle.")
+    parser.add_argument("bundle", type=Path, help="Run directory containing manifest.json")
+    args = parser.parse_args()
+    print(json.dumps(read_manifest(args.bundle)["evaluation"], indent=2))
 
 
 if __name__ == "__main__":

@@ -1,9 +1,10 @@
+from datetime import datetime, timezone
+import os
 from pathlib import Path
-import json
-import pickle
 import sys
+from typing import get_args
 
-import pandas as pd
+import requests
 import streamlit as st
 
 
@@ -13,204 +14,25 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 
-MODEL_PATH = (
-    PROJECT_ROOT
-    / "models"
-    / "best_sla_risk_model.pkl"
+from src.api_schemas import (
+    AssignedTeam,
+    Category,
+    Channel,
+    MAX_DESCRIPTION_LENGTH,
+    ModelInfoResponse,
+    PredictionResponse,
+    Priority,
+    Region,
 )
-
-THRESHOLD_PATH = (
-    PROJECT_ROOT
-    / "reports"
-    / "threshold_config.json"
-)
-
-
-st.set_page_config(
-    page_title="Intelligent Ticket Triage",
-    page_icon="🎫",
-    layout="wide",
-)
-
-
-@st.cache_resource
-def load_model():
-    """Load the trained SLA-risk model."""
-    if not MODEL_PATH.exists():
-        raise FileNotFoundError(
-            f"Model not found at {MODEL_PATH}. "
-            "Run `python src/train.py` first."
-        )
-
-    with MODEL_PATH.open("rb") as file:
-        return pickle.load(file)
-
-
-@st.cache_data
-def load_threshold() -> float:
-    """Load the tuned decision threshold."""
-    if not THRESHOLD_PATH.exists():
-        return 0.50
-
-    with THRESHOLD_PATH.open(
-        "r",
-        encoding="utf-8",
-    ) as file:
-        configuration = json.load(file)
-
-    return float(
-        configuration.get(
-            "selected_threshold",
-            0.50,
-        )
-    )
-
-
-def build_ticket_dataframe(
-    description: str,
-    region: str,
-    category: str,
-    priority: str,
-    assigned_team: str,
-    channel: str,
-    backlog_at_creation: int,
-    team_experience_years: float,
-    previous_reassignments: int,
-    weekend_created: int,
-    sla_target_hours: int,
-    created_hour: int,
-    day_of_week: int,
-    month: int,
-) -> pd.DataFrame:
-    """Create one model-ready ticket observation."""
-    description_length = len(
-        description.split()
-    )
-
-    quarter = (
-        (month - 1) // 3
-    ) + 1
-
-    ticket_age_bucket = pd.cut(
-        [backlog_at_creation],
-        bins=[0, 20, 40, 60, 120],
-        labels=[
-            "Low",
-            "Medium",
-            "High",
-            "Critical",
-        ],
-        include_lowest=True,
-    )[0]
-
-    is_month_end = 0
-
-    return pd.DataFrame(
-        [
-            {
-                "description": description,
-                "description_length":
-                    description_length,
-                "backlog_at_creation":
-                    backlog_at_creation,
-                "team_experience_years":
-                    team_experience_years,
-                "previous_reassignments":
-                    previous_reassignments,
-                "weekend_created":
-                    weekend_created,
-                "sla_target_hours":
-                    sla_target_hours,
-                "day_of_week":
-                    day_of_week,
-                "month":
-                    month,
-                "quarter":
-                    quarter,
-                "hour":
-                    created_hour,
-                "is_month_end":
-                    is_month_end,
-                "region":
-                    region,
-                "category":
-                    category,
-                "priority":
-                    priority,
-                "assigned_team":
-                    assigned_team,
-                "channel":
-                    channel,
-                "ticket_age_bucket":
-                    str(ticket_age_bucket),
-            }
-        ]
-    )
-
-
-def calculate_risk_level(
-    probability: float,
-    threshold: float,
-) -> str:
-    """Map probability to a business-facing risk level."""
-    if probability >= 0.75:
-        return "Critical"
-
-    if probability >= threshold:
-        return "High"
-
-    if probability >= 0.25:
-        return "Moderate"
-
-    return "Low"
-
-
-def create_recommendations(
-    probability: float,
-    threshold: float,
-    backlog: int,
-    previous_reassignments: int,
-    weekend_created: int,
-    priority: str,
-) -> list[str]:
-    """Create simple operational recommendations."""
-    recommendations = []
-
-    if probability >= threshold:
-        recommendations.append(
-            "Escalate the ticket for proactive review."
-        )
-
-    if backlog >= 60:
-        recommendations.append(
-            "Consider moving the ticket to a lower-load support team."
-        )
-
-    if previous_reassignments >= 2:
-        recommendations.append(
-            "Assign clear ownership to prevent further reassignment."
-        )
-
-    if weekend_created == 1:
-        recommendations.append(
-            "Confirm weekend or on-call coverage."
-        )
-
-    if priority in {"Low", "Medium"} and probability >= threshold:
-        recommendations.append(
-            "Review whether the current priority should be increased."
-        )
-
-    if not recommendations:
-        recommendations.append(
-            "Continue standard processing and monitor progress."
-        )
-
-    return recommendations
 
 
 def main() -> None:
     """Render the ticket-triage interface."""
+    st.set_page_config(
+        page_title="Intelligent Ticket Triage",
+        page_icon="🎫",
+        layout="wide",
+    )
     st.title("Intelligent Ticket Triage & SLA Risk Prediction")
 
     st.caption(
@@ -221,8 +43,9 @@ def main() -> None:
         """
     )
 
-    model = load_model()
-    threshold = load_threshold()
+    st.caption("Trained and evaluated on synthetic tickets. Real-ticket performance is unvalidated.")
+
+    api_url = os.environ.get("SLA_API_URL", "http://127.0.0.1:8000").rstrip("/")
 
     input_column, result_column = st.columns(
         [1.15, 0.85]
@@ -238,63 +61,19 @@ def main() -> None:
                 "multiple users in production"
             ),
             height=120,
+            max_chars=MAX_DESCRIPTION_LENGTH,
         )
 
         first_row_1, first_row_2 = st.columns(2)
 
         with first_row_1:
-            region = st.selectbox(
-                "Region",
-                [
-                    "Europe",
-                    "North America",
-                    "Asia Pacific",
-                ],
-            )
-
-            category = st.selectbox(
-                "Category",
-                [
-                    "Access Management",
-                    "Application Support",
-                    "Data Quality",
-                    "Infrastructure",
-                    "Workforce Operations",
-                ],
-                index=3,
-            )
-
-            priority = st.selectbox(
-                "Current priority",
-                [
-                    "Low",
-                    "Medium",
-                    "High",
-                    "Critical",
-                ],
-                index=1,
-            )
+            region = st.selectbox("Region", get_args(Region))
+            category = st.selectbox("Category", get_args(Category), index=3)
+            priority = st.selectbox("Current priority", get_args(Priority), index=1)
 
         with first_row_2:
-            assigned_team = st.selectbox(
-                "Assigned team",
-                [
-                    "Global Operations",
-                    "Regional Support",
-                    "Application Services",
-                    "Data Management",
-                ],
-            )
-
-            channel = st.selectbox(
-                "Channel",
-                [
-                    "Portal",
-                    "Email",
-                    "Phone",
-                    "Monitoring",
-                ],
-            )
+            assigned_team = st.selectbox("Assigned team", get_args(AssignedTeam))
+            channel = st.selectbox("Channel", get_args(Channel))
 
             sla_target_hours = st.number_input(
                 "SLA target in hours",
@@ -330,38 +109,15 @@ def main() -> None:
             )
 
         with second_row_2:
-            weekend_created = st.selectbox(
-                "Created during weekend",
-                options=[0, 1],
-                format_func=lambda value:
-                    "Yes" if value == 1 else "No",
+            created_date = st.date_input(
+                "Creation date (UTC)",
+                value=datetime.now(timezone.utc).date(),
             )
-
             created_hour = st.slider(
-                "Created hour",
+                "Creation hour (UTC)",
                 min_value=0,
                 max_value=23,
                 value=10,
-            )
-
-            day_of_week = st.selectbox(
-                "Day of week",
-                options=list(range(7)),
-                format_func=lambda value: [
-                    "Monday",
-                    "Tuesday",
-                    "Wednesday",
-                    "Thursday",
-                    "Friday",
-                    "Saturday",
-                    "Sunday",
-                ][value],
-            )
-
-            month = st.selectbox(
-                "Month",
-                options=list(range(1, 13)),
-                index=0,
             )
 
         predict_clicked = st.button(
@@ -374,53 +130,46 @@ def main() -> None:
         st.subheader("Risk Assessment")
 
         if predict_clicked:
-            input_data = build_ticket_dataframe(
-                description=description,
-                region=region,
-                category=category,
-                priority=priority,
-                assigned_team=assigned_team,
-                channel=channel,
-                backlog_at_creation=int(
-                    backlog_at_creation
-                ),
-                team_experience_years=float(
-                    team_experience_years
-                ),
-                previous_reassignments=int(
-                    previous_reassignments
-                ),
-                weekend_created=int(
-                    weekend_created
-                ),
-                sla_target_hours=int(
-                    sla_target_hours
-                ),
-                created_hour=int(
-                    created_hour
-                ),
-                day_of_week=int(
-                    day_of_week
-                ),
-                month=int(
-                    month
-                ),
+            created_at = datetime(
+                created_date.year, created_date.month, created_date.day,
+                created_hour, tzinfo=timezone.utc,
             )
+            if not description.strip():
+                st.error("Enter a ticket description before predicting.")
+                return
 
-            probability = float(
-                model.predict_proba(
-                    input_data
-                )[0, 1]
-            )
+            ticket = {
+                "description": description,
+                "region": region,
+                "category": category,
+                "priority": priority,
+                "assigned_team": assigned_team,
+                "channel": channel,
+                "backlog_at_creation": backlog_at_creation,
+                "team_experience_years": team_experience_years,
+                "previous_reassignments": previous_reassignments,
+                "sla_target_hours": sla_target_hours,
+                "created_at": created_at.isoformat(),
+            }
+            try:
+                response = requests.post(
+                    f"{api_url}/v1/predict",
+                    json=ticket,
+                    timeout=(2, 10),
+                    allow_redirects=False,
+                )
+                if response.status_code == 422:
+                    st.error("Check your ticket inputs and try again.")
+                    return
+                response.raise_for_status()
+                prediction = PredictionResponse.model_validate(response.json())
+            except (requests.RequestException, ValueError):
+                st.error("Prediction is currently unavailable. Check the inference API and try again.")
+                return
 
-            predicted_breach = (
-                probability >= threshold
-            )
-
-            risk_level = calculate_risk_level(
-                probability,
-                threshold,
-            )
+            probability = prediction.risk_score
+            threshold = prediction.decision_threshold
+            risk_level = prediction.risk_classification
 
             metric_1, metric_2 = st.columns(2)
 
@@ -467,62 +216,29 @@ def main() -> None:
 
             st.subheader("Suggested Action")
 
-            if predicted_breach:
-                suggested_priority = (
-                    "Critical"
-                    if probability >= 0.75
-                    else "High"
-                )
-            else:
-                suggested_priority = priority
+            st.write(f"Suggested operational priority: **{prediction.suggested_priority}**")
+            for recommendation in prediction.recommendations:
+                st.write(f"- {recommendation}")
 
-            st.write(
-                f"Suggested operational priority: "
-                f"**{suggested_priority}**"
-            )
-
-            recommendations = create_recommendations(
-                probability=probability,
-                threshold=threshold,
-                backlog=int(
-                    backlog_at_creation
-                ),
-                previous_reassignments=int(
-                    previous_reassignments
-                ),
-                weekend_created=int(
-                    weekend_created
-                ),
-                priority=priority,
-            )
-
-            for recommendation in recommendations:
-                st.write(
-                    f"- {recommendation}"
-                )
-
-            with st.expander(
-                "Model information"
-            ):
-                st.write(
-                    f"""
-                    **Selected model:** XGBoost classifier
-
-                    **Decision threshold:** {threshold:.2f}
-
-                    **Test performance:**
-
-                    - PR-AUC: 0.507
-                    - ROC-AUC: 0.869
-                    - Recall at selected threshold: 0.800
-                    - Precision at selected threshold: 0.344
-                    - F2 score: 0.633
-
-                    The threshold was selected to prioritize recall,
-                    because missing a likely SLA breach is considered
-                    more costly than reviewing an additional alert.
-                    """
-                )
+            with st.expander("Model information"):
+                st.write(f"**Bundle version:** {prediction.model_version}")
+                try:
+                    response = requests.get(f"{api_url}/v1/model/info", timeout=(2, 5))
+                    response.raise_for_status()
+                    info = ModelInfoResponse.model_validate(response.json())
+                except (requests.RequestException, ValueError):
+                    st.info("Model details are currently unavailable.")
+                else:
+                    if info.model_version == prediction.model_version:
+                        metrics = info.holdout_metrics
+                        st.write(f"**Selected model:** {info.model_name.replace('_', ' ').title()}")
+                        st.write("**Synthetic holdout performance**")
+                        st.write(
+                            f"Average precision {metrics.average_precision:.3f} · "
+                            f"ROC-AUC {metrics.roc_auc:.3f} · "
+                            f"Precision {metrics.precision:.3f} · "
+                            f"Recall {metrics.recall:.3f} · F2 {metrics.f2:.3f}"
+                        )
 
         else:
             st.info(

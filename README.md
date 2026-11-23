@@ -17,15 +17,15 @@ This project predicts whether a newly created operational ticket is likely to br
 
 The application provides:
 
-- SLA breach probability
+- Estimated SLA breach probability
 - Business-facing risk level
 - Suggested ticket priority
 - Operational recommendations
 - Tuned decision threshold
-- Interactive Streamlit interface
+- Versioned FastAPI inference service and interactive Streamlit interface
 - Dockerized deployment
 
-The project uses synthetic, non-confidential enterprise-style ticket data.
+**All training and evaluation data is synthetic. These results have not been validated on real tickets.**
 
 ---
 
@@ -70,13 +70,13 @@ Model Training
    └──────────────────────┘
         |
         v
-Model Selection using PR-AUC
+Validation: Select Model by Average Precision and Threshold by F2
         |
         v
-Threshold Optimization using F2
+Test: Evaluate the Frozen Model and Threshold Once
         |
         v
-Streamlit Risk Assessment App
+Versioned Model Bundle → FastAPI → Streamlit Risk Assessment App
 ```
 
 ---
@@ -116,6 +116,8 @@ The generated SLA breach rate is approximately 12%.
 
 ## Feature Engineering
 
+Training and Streamlit use the same feature code in `src/features.py`. The creation timestamp is normalized to UTC. Naive CSV timestamps are interpreted as UTC, and the form collects a UTC date and hour. Weekday, weekend, month, quarter, hour, and month-end are derived from that timestamp. A backlog of zero maps to the Low bucket.
+
 ### Text features
 
 Ticket descriptions are transformed using TF-IDF with:
@@ -152,65 +154,33 @@ Ticket descriptions are transformed using TF-IDF with:
 
 ## Models
 
-Two classification pipelines were compared:
+Training compares two classification pipelines:
 
 | Model | Purpose |
 |---|---|
 | Logistic Regression | Interpretable baseline |
-| XGBoost Classifier | Final nonlinear model |
+| XGBoost Classifier | Nonlinear candidate |
 
-The data was split chronologically:
+Training targets a chronological 60% train, 20% validation, and 20% test split.
+Tickets with the same creation timestamp stay together in the later partition, so actual row counts can vary.
 
-- 80% older tickets for training
-- 20% newer tickets for testing
+Label availability follows the simulator's rule that resolution after the SLA deadline counts as a breach. A non-breach becomes observable on resolution, including resolution exactly at the deadline. An unresolved ticket's breach becomes observable at its SLA deadline. The CSV stores rounded resolution hours and the generator computes the label before rounding. Training uses the recorded label to disambiguate a rounded tie.
 
-This avoids evaluating the model on historical records after learning from newer tickets.
+Training and validation use labels observable by the first creation timestamp of the next partition, inclusive. Test uses labels observable by the evaluation cutoff. The default synthetic cutoff is the latest SLA deadline among test tickets, which assumes continuous observation through that time. Use `--evaluation-cutoff <timestamp>` to simulate an earlier observation cutoff. The manifest records the cutoff and excluded row count for each partition.
 
----
+- **Train** fits both candidates and their preprocessing.
+- **Validation** selects the candidate with the highest average precision. It selects the threshold that maximizes F2 over 0.10–0.90 in 0.01 increments among cutoffs with precision of at least 0.30. If none qualify, it chooses the best F2 across the grid and records that the floor was missed.
+- **Test** scores the frozen winner once at the validation-selected threshold. The model is served as fitted on the training partition.
 
 ## Model Performance
 
-| Model | Accuracy | Precision | Recall | F1 | ROC-AUC | PR-AUC |
-|---|---:|---:|---:|---:|---:|---:|
-| Logistic Regression | 0.789 | 0.340 | 0.821 | 0.481 | 0.876 | 0.500 |
-| **XGBoost Classifier** | **0.820** | **0.374** | 0.758 | **0.501** | 0.869 | **0.507** |
+Each run's `manifest.json` records the candidate validation scores, threshold selection, partition date ranges, and the final synthetic holdout results. Holdout metrics include average precision, ROC-AUC, accuracy, precision, recall, F1, F2, the confusion matrix counts, and alert volume.
 
-XGBoost was selected using PR-AUC because SLA breaches represent only around 12% of the dataset.
-
-Accuracy alone would be misleading for this imbalanced classification problem.
-
----
-
-## Decision Threshold Optimization
-
-The default classification threshold of 0.50 was compared with alternative thresholds.
-
-The final threshold was selected using F2 score, which gives more importance to recall than precision.
-
-### Final operating threshold
-
-```text
-0.45
-```
-
-### Performance at the selected threshold
-
-- Precision: 0.344
-- Recall: 0.800
-- F1: 0.482
-- F2: 0.633
-- True positives: 228
-- False negatives: 57
-
-Compared with the default threshold, the selected threshold identifies 12 additional SLA breaches and reduces false negatives from 69 to 57.
-
-This reflects the business assumption that missing a likely breach is more costly than reviewing an additional alert.
-
----
+The final window is held out from Phase 1 fitting and selection. The original prototype reported results on this same window. A historically blind benchmark requires fresh data.
 
 ## Streamlit Application
 
-The application allows users to enter ticket characteristics and receive an immediate SLA risk assessment.
+The Streamlit interface sends ticket details to FastAPI and displays the score, priority, recommendations, and model information returned by the service.
 
 The interface includes:
 
@@ -224,11 +194,11 @@ The interface includes:
 - Team backlog
 - Team experience
 - Previous reassignments
-- Creation timing
+- Creation date and hour in UTC
 
 The output includes:
 
-- SLA breach probability
+- Estimated SLA breach probability
 - Risk level
 - Decision threshold
 - Suggested operational priority
@@ -261,24 +231,25 @@ intelligent-ticket-triage/
 │   └── processed/
 │
 ├── models/
-│   └── best_sla_risk_model.pkl
-│
-├── reports/
-│   ├── model_metrics.json
-│   ├── test_predictions.csv
-│   ├── threshold_config.json
-│   └── figures/
-│
+│   ├── best_sla_risk_model.pkl  # Historical prototype artifact
+│   └── runs/                   # Generated versioned bundles (ignored by Git)
+├── reports/                    # Historical prototype reports
 ├── src/
-│   ├── generate_data.py
+│   ├── api.py
+│   ├── api_schemas.py
+│   ├── bundle.py
+│   ├── evaluate.py
 │   ├── features.py
-│   ├── train.py
-│   └── evaluate.py
-│
+│   ├── generate_data.py
+│   ├── inference.py
+│   └── train.py
+├── tests/
 ├── Dockerfile
+├── compose.yaml
 ├── .dockerignore
 ├── .gitignore
 ├── requirements.txt
+├── requirements-dev.txt
 └── README.md
 ```
 
@@ -321,66 +292,145 @@ pip install -r requirements.txt
 
 ## Running the Project
 
-Generate the synthetic ticket dataset:
-
-```bash
-python src/generate_data.py
-```
-
-Create engineered features:
-
-```bash
-python src/features.py
-```
-
-Train and compare the models:
+Train using the checked-in synthetic CSV:
 
 ```bash
 python src/train.py
 ```
 
-Optimize the decision threshold:
+Training prints the path to a new `models/runs/<version>/` directory. Each run contains a fitted `model.pkl` and a `manifest.json` with the model identity and checksum, threshold, feature schema, dependency versions, dataset checksum, and evaluation. Keep both files together. Only load bundles generated by a trusted training run because the pipeline uses Python pickle.
+
+Inspect the saved evaluation and start the API, replacing `<version>` with the printed directory name:
 
 ```bash
-python src/evaluate.py
+python src/evaluate.py models/runs/<version>
+export SLA_MODEL_BUNDLE="$PWD/models/runs/<version>"
+python -m uvicorn src.api:app --host 127.0.0.1 --port 8000 --no-access-log
 ```
 
-Launch the Streamlit application:
+In a second terminal with the same virtual environment active, start Streamlit:
 
 ```bash
 streamlit run app/app.py
 ```
 
-Open:
+Open the [Streamlit interface](http://localhost:8501) or [interactive API docs](http://127.0.0.1:8000/docs). Streamlit defaults to `http://127.0.0.1:8000`. Set `SLA_API_URL` in the Streamlit process to use a different API address. In PowerShell, set environment variables with `$env:SLA_MODEL_BUNDLE = "models/runs/<version>"` or `$env:SLA_API_URL = "http://127.0.0.1:8000"`.
 
-```text
-http://localhost:8501
+The training command reads the raw CSV directly. `python src/features.py` exports a feature inspection CSV. `python src/generate_data.py` regenerates the synthetic input CSV at its original path.
+
+## Inference API
+
+| Method and path | Behavior |
+|---|---|
+| `POST /v1/predict` | Scores one ticket using the loaded bundle and returns the risk score, decision threshold, risk classification, suggested priority, and recommendations. |
+| `GET /v1/model/info` | Returns the loaded model name and version, schema version, threshold, and synthetic holdout metrics. |
+| `GET /health/live` | Returns HTTP 200 while the service is running. |
+| `GET /health/ready` | Returns the cached model probe status. HTTP 503 with `{"status":"not_ready"}` means the model is unavailable or its probe failed or timed out. |
+
+Prediction and model info return HTTP 503 when the model is unavailable. The worker probes at startup and waits 10 seconds between attempts. A probe has a two-second readiness deadline. Timed-out native work must finish before the next attempt, and a successful subsequent probe restores readiness. Restart the API after correcting or changing the configured bundle. The server loads the bundle once per worker.
+
+Configure only a trusted bundle from your own training run. The checksum stored beside the pickle detects corruption and mismatches. Independent authenticity verification would require a digest or signature from a separate trusted source. The local workflow relies on operator selection and storage permissions.
+
+Prediction requests use the regions, categories, teams, priorities, and channels offered by Streamlit. Numeric ranges are 0–120 for backlog, 0.5–10 for team experience, 0–4 for prior reassignments, and 1–168 for SLA hours. Send a nonblank description of at most 4,096 characters and an ISO 8601 creation timestamp with a timezone offset and a year from 1900 through 2100. Validation failures return HTTP 422 with field names and error codes. The service omits submitted inputs from validation errors and application logs.
+
+Prediction bodies over 64 KiB return HTTP 413, including streamed bodies. Validation responses include up to eight issues.
+
+### Example request and response
+
+```bash
+curl -sS http://127.0.0.1:8000/v1/predict \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "description": "Shared service is unavailable and blocking multiple users in production",
+    "region": "Europe",
+    "category": "Infrastructure",
+    "priority": "Medium",
+    "assigned_team": "Global Operations",
+    "channel": "Portal",
+    "backlog_at_creation": 55,
+    "team_experience_years": 3.0,
+    "previous_reassignments": 1,
+    "sla_target_hours": 36,
+    "created_at": "2024-08-31T10:00:00Z"
+  }'
 ```
 
----
+Example response from the Phase 1 logistic regression bundle:
+
+```json
+{
+  "model_version": "20261122T234219Z-413bc1f85a20",
+  "risk_score": 0.7526181558213306,
+  "decision_threshold": 0.5,
+  "risk_classification": "Critical",
+  "suggested_priority": "Critical",
+  "recommendations": [
+    "Escalate the ticket for proactive review.",
+    "Confirm weekend or on-call coverage.",
+    "Review whether the current priority should be increased."
+  ]
+}
+```
+
+**The current model was evaluated on synthetic data only. Real-ticket validation is pending.**
+
+### Tests
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest
+```
+
+The suite includes a release smoke test that trains both candidates from the tracked synthetic CSV, writes a temporary bundle, and sends an HTTP prediction through FastAPI's TestClient.
+
+### GitHub Actions CI
+
+The `CI` workflow runs on pull requests and pushes to `main` on Ubuntu 24.04 with Python 3.12. It has read-only repository permissions. The PR job builds locally on the runner and uses no publishing credentials. The Docker build context admits only the runtime source files and requirements.
+
+The job installs the pinned dependencies, checks them with `pip check`, and runs pytest with a five-minute limit and thread stack dumps for stalled tests. It builds the Docker image and trains a fresh bundle from the tracked synthetic CSV in an isolated runner temporary directory. The smoke test starts the image with that bundle mounted read-only on an ephemeral loopback port. It checks liveness, readiness, model info, and repeated predictions. Both model info and prediction must match the generated manifest's version and threshold. The generated bundle and test container are temporary.
+
+Run the same checks locally in an activated Python 3.12 virtual environment with Docker available. The shell command for the pytest timeout assumes Linux with GNU coreutils.
+
+```bash
+python -m pip install -r requirements-dev.txt
+python -m pip check
+OMP_THREAD_LIMIT=2 OPENBLAS_NUM_THREADS=2 timeout --kill-after=15s 5m \
+  python -m pytest -ra --tb=long -o faulthandler_timeout=45
+docker build --tag intelligent-ticket-triage:ci .
+python scripts/ci_smoke.py --image intelligent-ticket-triage:ci
+```
+
+If the Docker daemon cannot see your system temporary directory, set `RUNNER_TEMP` to a writable directory visible to both the shell and Docker before running the smoke script.
+
+Use the failed step name to narrow down problems. Dependency installation and `pip check` failures point to package resolution or platform compatibility. Pytest prints assertion tracebacks and stack dumps for stalls. A smoke failure prints the container logs and identifies where readiness, model metadata, or prediction verification failed. Trivy reports high and critical vulnerabilities in the image OS and installed runtime packages. Findings are advisory in this CI workflow so they can be triaged separately from failures to run the scanner.
+
+### Security status
+
+The Phase 3.6 Linux amd64 image scan used the same Trivy database as the Phase 3 baseline. HIGH findings fell from 91 to 50 and CRITICAL findings from seven to zero. The dependency and Debian zlib changes resolved 48 package-level findings at those severities. The scan reported no new HIGH or CRITICAL findings. Lower-severity findings remain in the full JSON report.
+
+The remaining 50 HIGH rows represent 12 Debian Trixie advisories. Multiple binary packages built from the same source account for 38 repeat rows. Debian listed no Trixie fix for these advisories at review time.
+
+| Debian source | Remaining HIGH advisories | Runtime relevance |
+|---|---|---|
+| util-linux | CVE-2026-76642, CVE-2026-78408, CVE-2026-78409, CVE-2026-78410 | Mount and namespace tools are present. The service runs as a non-root user and ticket handling does not call these tools. |
+| OpenSSL | CVE-2026-124709 | Python links OpenSSL. The advisory concerns QUIC and the configured API server uses HTTP. |
+| SQLite | CVE-2026-119373, CVE-2026-119374, CVE-2026-119379 | Python links SQLite. Ticket input provides neither SQL nor database files. |
+| ncurses | CVE-2025-69720 | The image contains terminal libraries. Ticket handling does not use terminal input. |
+| systemd | CVE-2026-16742 | Supporting libraries are present. The image lacks the affected systemd-homed executable. |
+| ACL and Perl | CVE-2026-54369, CVE-2026-9538 | These are base-image components. Ticket handling does not pass paths or archives to them. |
+
+These exposure notes describe the local demo configuration. Before public distribution, rescan the candidate digest with a current database and review residual risk. Keep the API and UI on loopback for local use, and configure access controls before public hosting. Images and model bundles have separate trust boundaries. Only mount trusted bundles and verify their provenance independently before distributing any pickle.
 
 ## Docker
 
-Build the Docker image:
+Train locally first and export the path to a trusted bundle. Docker Compose starts separate API and Streamlit containers and publishes their ports on loopback. The API runs as a non-root user and mounts the bundle read-only. The selected run directory and its files need to be readable by the container user.
 
 ```bash
-docker build -t intelligent-ticket-triage:1.0 .
+export SLA_MODEL_BUNDLE="$PWD/models/runs/<version>"
+docker compose up --build --wait
 ```
 
-Run the container:
-
-```bash
-docker run --rm \
-  --name intelligent-ticket-triage \
-  -p 8501:8501 \
-  intelligent-ticket-triage:1.0
-```
-
-Open:
-
-```text
-http://localhost:8501
-```
+Open `http://localhost:8501` for Streamlit and `http://127.0.0.1:8000/docs` for the API. Stop the services with `docker compose stop`.
 
 ---
 
@@ -393,6 +443,7 @@ http://localhost:8501
 - XGBoost
 - TF-IDF
 - Streamlit
+- FastAPI
 - Docker
 - Git
 
@@ -413,7 +464,7 @@ The project demonstrates how machine learning can support operational ticket man
 
 ## Limitations
 
-- The dataset is synthetic and does not represent real production performance.
+- The dataset is synthetic and no real-ticket validation or probability calibration has been performed.
 - Operational recommendations are rule-based.
 - The model does not currently include live queue updates.
 - The ticket text vocabulary is limited by the synthetic data generator.
@@ -430,7 +481,6 @@ Potential extensions include:
 - Cost-sensitive threshold optimization
 - Automated retraining
 - Model drift monitoring
-- API integration
 - Live ticket-system integration
 - Resolution-time regression
 

@@ -1,17 +1,19 @@
-.venv
-.git
-.gitignore
-__pycache__
-*.pyc
-*.pyo
-*.pyd
-.ipynb_checkpoints
-
-data
-notebooks
-tests
-reports/*
-!reports/threshold_config.json
-
-.DS_Store
-Thumbs.db
+# Only inputs used by the application image. Local files and credentials
+# outside this list stay out of the build context.
+**
+!Dockerfile
+!requirements.txt
+!app/
+app/**
+!app/app.py
+!src/
+src/**
+!src/api.py
+!src/api_schemas.py
+!src/bundle.py
+!src/evaluate.py
+!src/features.py
+!src/generate_data.py
+!src/inference.py
+!src/request_limits.py
+!src/train.py
