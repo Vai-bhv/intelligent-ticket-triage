@@ -3,7 +3,7 @@
 > An end-to-end machine learning application for predicting SLA breach risk in operational support tickets using text, workload, team, and ticket characteristics.
 
 ![Python](https://img.shields.io/badge/Python-3.12-blue)
-![XGBoost](https://img.shields.io/badge/Model-XGBoost-success)
+![scikit-learn](https://img.shields.io/badge/ML-scikit--learn-success)
 ![Streamlit](https://img.shields.io/badge/UI-Streamlit-red)
 ![Docker](https://img.shields.io/badge/Container-Docker-blue)
 
@@ -17,7 +17,7 @@ This project predicts whether a newly created operational ticket is likely to br
 
 The application provides:
 
-- Estimated SLA breach probability
+- SLA breach risk score
 - Business-facing risk level
 - Suggested ticket priority
 - Operational recommendations
@@ -26,6 +26,33 @@ The application provides:
 - Dockerized deployment
 
 **All training and evaluation data is synthetic. These results have not been validated on real tickets.**
+
+## Quick Demo
+
+On Linux, use Bash with Git, Python 3.12 and its `venv` module, Docker with Compose v2, and curl. Run these commands in the same shell. Training uses the tracked CSV and generates a new bundle for this demo.
+
+```bash
+git clone https://github.com/Vai-bhv/intelligent-ticket-triage.git
+cd intelligent-ticket-triage
+python3.12 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+
+demo_runs="$(mktemp -d "$PWD/models/demo.XXXXXX")"
+python src/train.py --output-dir "$demo_runs" &&
+  export SLA_MODEL_BUNDLE="$(find "$demo_runs" -mindepth 1 -maxdepth 1 -type d -print -quit)" &&
+  docker compose up --build --wait
+```
+
+Open [Streamlit](http://127.0.0.1:8501) and use **Predict SLA Risk** with the example ticket, or explore the [API docs](http://127.0.0.1:8000/docs).
+
+```bash
+curl -fsS http://127.0.0.1:8000/health/live
+curl -fsS http://127.0.0.1:8000/health/ready
+curl -fsS http://127.0.0.1:8501/_stcore/health
+```
+
+When finished, run `docker compose down` in the same shell. The generated bundle stays in the ignored `models/` directory. See [Docker](#docker) for mount details and [Inference API](#inference-api) for an example request.
 
 ---
 
@@ -48,35 +75,40 @@ The goal is to identify likely SLA breaches early enough for teams to intervene.
 
 ---
 
-## Machine Learning Workflow
+## Architecture
 
-```text
-Synthetic Ticket Data
-        |
-        v
-Feature Engineering
-        |
-        v
-Text Processing with TF-IDF
-        |
-        v
-Numerical and Categorical Preprocessing
-        |
-        v
-Model Training
-   ┌──────────────────────┐
-   │ Logistic Regression  │
-   │ XGBoost Classifier   │
-   └──────────────────────┘
-        |
-        v
-Validation: Select Model by Average Precision and Threshold by F2
-        |
-        v
-Test: Evaluate the Frozen Model and Threshold Once
-        |
-        v
-Versioned Model Bundle → FastAPI → Streamlit Risk Assessment App
+```mermaid
+flowchart TD
+    subgraph offline["A. Offline training and evaluation"]
+        csv["Tracked synthetic CSV<br/>data/raw/support_tickets.csv"]
+        features["Shared feature engineering module<br/>normalize creation timestamps"]
+        split["Chronological train / validation / test<br/>with label-maturity cutoffs"]
+        fit["Train: derive features and fit<br/>preprocessing and candidates"]
+        select["Validation: select by average precision<br/>and tune cutoff by F2"]
+        test["Test: evaluate frozen model and cutoff once"]
+        bundle["Versioned bundle<br/>model.pkl and manifest.json"]
+        csv --> features --> split --> fit --> select --> test --> bundle
+    end
+
+    subgraph online["B. Online inference"]
+        user["User"]
+        subgraph compose["Docker Compose"]
+            subgraph ui_container["Streamlit container"]
+                ui["Streamlit UI"]
+            end
+            subgraph api_container["FastAPI container"]
+                endpoint["POST /v1/predict<br/>shared feature engineering"]
+                loaded["Trusted model bundle<br/>loaded at startup"]
+                result["Risk prediction and<br/>rule-based recommendations"]
+                endpoint --> loaded --> result
+            end
+        end
+        user --> ui
+        ui -->|HTTP request| endpoint
+        result -->|HTTP response| ui
+    end
+
+    bundle -->|Read-only mount| loaded
 ```
 
 ---
@@ -174,9 +206,26 @@ Training and validation use labels observable by the first creation timestamp of
 
 ## Model Performance
 
-Each run's `manifest.json` records the candidate validation scores, threshold selection, partition date ranges, and the final synthetic holdout results. Holdout metrics include average precision, ROC-AUC, accuracy, precision, recall, F1, F2, the confusion matrix counts, and alert volume.
+These results come from the Phase 2.6 bundle `20261123T000632Z-5807852ac684`. The run excluded 13 immature training labels and 14 immature validation labels. All 2,400 final test labels were observable by the evaluation cutoff. Each run's generated `manifest.json` records its own metrics, cutoffs, and counts.
 
-The final window is held out from Phase 1 fitting and selection. The original prototype reported results on this same window. A historically blind benchmark requires fresh data.
+| Synthetic holdout metric | Value |
+|---|---:|
+| Model | Logistic regression |
+| Validation-selected threshold | 0.51 |
+| Average precision | 0.501 |
+| ROC-AUC | 0.876 |
+| Precision | 0.342 |
+| Recall | 0.793 |
+| F1 | 0.478 |
+| F2 | 0.627 |
+| Alerts | 661 |
+| True positives | 226 |
+| False positives | 435 |
+| False negatives | 59 |
+
+At this threshold, the model caught 226 of 285 simulated breaches. It also flagged 435 tickets that met their SLA, so roughly two-thirds of alerts would require review without a breach occurring.
+
+The Phase 2.6 run reserved this window for final scoring. The original prototype also reported results on the same window, so a fully blind independent benchmark requires fresh data.
 
 ## Streamlit Application
 
@@ -198,7 +247,7 @@ The interface includes:
 
 The output includes:
 
-- Estimated SLA breach probability
+- SLA breach risk score
 - Risk level
 - Decision threshold
 - Suggested operational priority
@@ -267,7 +316,7 @@ cd intelligent-ticket-triage
 Create a virtual environment:
 
 ```bash
-python3 -m venv .venv
+python3.12 -m venv .venv
 ```
 
 Activate it on Linux or macOS:
@@ -303,7 +352,7 @@ Training prints the path to a new `models/runs/<version>/` directory. Each run c
 Inspect the saved evaluation and start the API, replacing `<version>` with the printed directory name:
 
 ```bash
-python src/evaluate.py models/runs/<version>
+python src/evaluate.py "models/runs/<version>"
 export SLA_MODEL_BUNDLE="$PWD/models/runs/<version>"
 python -m uvicorn src.api:app --host 127.0.0.1 --port 8000 --no-access-log
 ```
@@ -449,25 +498,11 @@ Open `http://localhost:8501` for Streamlit and `http://127.0.0.1:8000/docs` for 
 
 ---
 
-## Business Value
-
-The project demonstrates how machine learning can support operational ticket management by:
-
-- Identifying high-risk tickets earlier
-- Prioritizing proactive intervention
-- Reducing missed SLA deadlines
-- Supporting workload balancing
-- Improving ticket ownership
-- Converting model probabilities into practical recommendations
-
----
-
 ## Limitations
 
-- The dataset is synthetic and no real-ticket validation or probability calibration has been performed.
-- Operational recommendations are rule-based.
+- The synthetic dataset repeats a limited set of description patterns. The generator also builds relationships between ticket fields and outcomes, which the models can learn. The holdout measures performance on this simulation. Generalization to real tickets remains untested.
+- Probability calibration has not been validated. Treat the numeric output as a risk score. The suggested priority and operational recommendations follow rules.
 - The model does not currently include live queue updates.
-- The ticket text vocabulary is limited by the synthetic data generator.
 - Model monitoring and drift detection are not implemented.
 
 ---
