@@ -404,6 +404,23 @@ If the Docker daemon cannot see your system temporary directory, set `RUNNER_TEM
 
 Use the failed step name to narrow down problems. Dependency installation and `pip check` failures point to package resolution or platform compatibility. Pytest prints assertion tracebacks and stack dumps for stalls. A smoke failure prints the container logs and identifies where readiness, model metadata, or prediction verification failed. Trivy reports high and critical vulnerabilities in the image OS and installed runtime packages. Findings are advisory in this CI workflow so they can be triaged separately from failures to run the scanner.
 
+### Security status
+
+The Phase 3.6 Linux amd64 image scan used the same Trivy database as the Phase 3 baseline. HIGH findings fell from 91 to 50 and CRITICAL findings from seven to zero. The dependency and Debian zlib changes resolved 48 package-level findings at those severities. The scan reported no new HIGH or CRITICAL findings. Lower-severity findings remain in the full JSON report.
+
+The remaining 50 HIGH rows represent 12 Debian Trixie advisories. Multiple binary packages built from the same source account for 38 repeat rows. Debian listed no Trixie fix for these advisories at review time.
+
+| Debian source | Remaining HIGH advisories | Runtime relevance |
+|---|---|---|
+| util-linux | CVE-2026-76642, CVE-2026-78408, CVE-2026-78409, CVE-2026-78410 | Mount and namespace tools are present. The service runs as a non-root user and ticket handling does not call these tools. |
+| OpenSSL | CVE-2026-124709 | Python links OpenSSL. The advisory concerns QUIC and the configured API server uses HTTP. |
+| SQLite | CVE-2026-119373, CVE-2026-119374, CVE-2026-119379 | Python links SQLite. Ticket input provides neither SQL nor database files. |
+| ncurses | CVE-2025-69720 | The image contains terminal libraries. Ticket handling does not use terminal input. |
+| systemd | CVE-2026-16742 | Supporting libraries are present. The image lacks the affected systemd-homed executable. |
+| ACL and Perl | CVE-2026-54369, CVE-2026-9538 | These are base-image components. Ticket handling does not pass paths or archives to them. |
+
+These exposure notes describe the local demo configuration. Before public distribution, rescan the candidate digest with a current database and review residual risk. Keep the API and UI on loopback for local use, and configure access controls before public hosting. Images and model bundles have separate trust boundaries. Only mount trusted bundles and verify their provenance independently before distributing any pickle.
+
 ## Docker
 
 Train locally first and export the path to a trusted bundle. Docker Compose starts separate API and Streamlit containers and publishes their ports on loopback. The API runs as a non-root user and mounts the bundle read-only. The selected run directory and its files need to be readable by the container user.
